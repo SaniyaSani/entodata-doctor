@@ -263,6 +263,10 @@
     issues: [],
     changes: [],
     filter: "all",
+    issueView: "grouped",
+    issueStatus: "open",
+    ignoredIssueKeys: new Set(),
+    bulkFill: null,
     previewMode: "current",
     previewPage: 0,
     previewRowsPerPage: 20,
@@ -616,6 +620,10 @@
     state.changes = [];
     state.exported = false;
     state.filter = "all";
+    state.issueView = "grouped";
+    state.issueStatus = "open";
+    state.ignoredIssueKeys = new Set();
+    state.bulkFill = null;
     state.previewPage = 0;
     state.previewScrollLeft = 0;
     state.previewScrollTop = 0;
@@ -747,6 +755,8 @@
     state.mapping = inferMapping(state.columns);
     state.issues = [];
     state.changes = [];
+    state.ignoredIssueKeys = new Set();
+    state.bulkFill = null;
   }
 
   function inferMapping(columns) {
@@ -919,8 +929,27 @@
     document.getElementById("new-file-button").addEventListener("click", resetApp);
   }
 
+  function issueIdentity(issue) {
+    return JSON.stringify([
+      issue.rowIndex == null ? "table" : issue.rowIndex,
+      issue.column || "",
+      issue.field || "",
+      issue.message || "",
+      String(issue.original == null ? "" : issue.original),
+      String(issue.proposed == null ? "" : issue.proposed),
+    ]);
+  }
+
+  function issueGroupKey(issue) {
+    return JSON.stringify([
+      issue.severity || "warning",
+      issue.field || "Table",
+      issue.message || "Issue",
+    ]);
+  }
+
   function addIssue(issue) {
-    state.issues.push({
+    const completeIssue = {
       id: `issue-${state.issues.length + 1}`,
       rowIndex: null,
       excelRow: null,
@@ -934,7 +963,11 @@
       safe: false,
       confirm: false,
       ...issue,
-    });
+    };
+    completeIssue.key = issueIdentity(completeIssue);
+    completeIssue.groupKey = issueGroupKey(completeIssue);
+    completeIssue.ignored = state.ignoredIssueKeys.has(completeIssue.key);
+    state.issues.push(completeIssue);
   }
 
   function valueAt(row, fieldKey) {
@@ -1532,13 +1565,30 @@
   function issueCounts() {
     return state.issues.reduce(
       (counts, issue) => {
+        if (issue.ignored) {
+          counts.ignored += 1;
+          return counts;
+        }
+        counts.total += 1;
         counts[issue.severity] = (counts[issue.severity] || 0) + 1;
         if (issue.safe) counts.safe += 1;
         if (issue.confirm) counts.confirm += 1;
         return counts;
       },
-      { critical: 0, warning: 0, formatting: 0, safe: 0, confirm: 0 },
+      {
+        total: 0,
+        ignored: 0,
+        critical: 0,
+        warning: 0,
+        formatting: 0,
+        safe: 0,
+        confirm: 0,
+      },
     );
+  }
+
+  function problemTypeCount(issues) {
+    return new Set(issues.map((issue) => issue.groupKey)).size;
   }
 
   function severityIcon(issue) {
@@ -1549,32 +1599,109 @@
     return `<span class="severity-icon icon-safe">✓</span>`;
   }
 
-  function issueRowsMarkup() {
+  function visibleIssues() {
     const priority = { critical: 0, warning: 1, formatting: 2 };
-    const filtered = state.issues
+    return state.issues
       .filter(
-        (issue) => state.filter === "all" || issue.severity === state.filter,
+        (issue) =>
+          (state.issueStatus === "ignored" ? issue.ignored : !issue.ignored) &&
+          (state.filter === "all" || issue.severity === state.filter),
       )
       .slice()
       .sort((a, b) => {
         const severityDifference =
-          (priority[a.severity] || 0) - (priority[b.severity] || 0);
+          priority[a.severity] - priority[b.severity];
         if (severityDifference) return severityDifference;
         return (a.excelRow || 0) - (b.excelRow || 0);
       });
-    if (!filtered.length) {
-      return `<div class="empty-state">
-        <span class="empty-state-icon">✓</span>
-        <strong>No issues in this category</strong>
-        <span>Try another filter or export the cleaned table.</span>
-      </div>`;
+  }
+
+  function compactNumberRanges(rowNumbers) {
+    const rows = [...new Set(rowNumbers.filter(Number.isFinite))].sort(
+      (a, b) => a - b,
+    );
+    if (!rows.length) return "";
+
+    const ranges = [];
+    let start = rows[0];
+    let end = rows[0];
+    for (let index = 1; index <= rows.length; index += 1) {
+      const value = rows[index];
+      if (value === end + 1) {
+        end = value;
+        continue;
+      }
+      ranges.push(start === end ? `${start}` : `${start}–${end}`);
+      start = value;
+      end = value;
+    }
+    return ranges.join(", ");
+  }
+
+  function compactRowRanges(rowNumbers) {
+    const ranges = compactNumberRanges(rowNumbers);
+    return ranges ? `Rows ${ranges}` : "Table-level issue";
+  }
+
+  function proposalPairs(issues) {
+    const pairs = new Map();
+    issues.forEach((issue) => {
+      if (issue.proposed == null) return;
+      const key = JSON.stringify([
+        displayValue(issue.original),
+        displayValue(issue.proposed),
+      ]);
+      if (!pairs.has(key)) {
+        pairs.set(key, {
+          original: displayValue(issue.original),
+          proposed: displayValue(issue.proposed),
+          count: 0,
+        });
+      }
+      pairs.get(key).count += 1;
+    });
+    return [...pairs.values()].sort((a, b) => b.count - a.count);
+  }
+
+  function canBulkFill(issues) {
+    if (state.issueStatus === "ignored") return false;
+    const columns = new Set(
+      issues
+        .filter((issue) => issue.rowIndex != null && issue.column)
+        .map((issue) => issue.column),
+    );
+    if (columns.size !== 1) return false;
+    const column = [...columns][0];
+    return issues.some(
+      (issue) =>
+        issue.rowIndex != null &&
+        state.rows[issue.rowIndex] &&
+        isEmpty(state.rows[issue.rowIndex][column]),
+    );
+  }
+
+  function emptyIssuesMarkup() {
+    const ignoredCopy =
+      state.issueStatus === "ignored"
+        ? "Nothing has been ignored in this category."
+        : "Try another filter or export the cleaned table.";
+    return `<div class="empty-state">
+      <span class="empty-state-icon">✓</span>
+      <strong>No issues in this category</strong>
+      <span>${ignoredCopy}</span>
+    </div>`;
+  }
+
+  function issueRowsMarkup(issues = visibleIssues()) {
+    if (!issues.length) {
+      return emptyIssuesMarkup();
     }
 
-    return filtered
+    return issues
       .slice(0, 400)
       .map(
         (issue) => `
-        <article class="issue-row">
+        <article class="issue-row ${issue.ignored ? "is-ignored" : ""}">
           ${severityIcon(issue)}
           <span class="row-number">${issue.excelRow ? `Row ${issue.excelRow}` : "Table"}</span>
           <div class="issue-copy">
@@ -1592,7 +1719,7 @@
           </div>
           <div class="issue-action">
             ${
-              issue.safe || issue.confirm
+              !issue.ignored && (issue.safe || issue.confirm)
                 ? `<button class="small-button" type="button" data-fix-issue="${issue.id}">${
                     issue.safe ? "Apply fix" : "Use suggestion"
                   }</button>`
@@ -1603,15 +1730,170 @@
                 ? `<button class="small-button edit-cell-button" type="button" data-edit-issue="${issue.id}">Edit cell</button>`
                 : ""
             }
+            <button class="small-button ${
+              issue.ignored ? "restore-button" : "ignore-button"
+            }" type="button" ${
+              issue.ignored
+                ? `data-restore-issue="${issue.id}">Restore`
+                : `data-ignore-issue="${issue.id}">Ignore`
+            }</button>
           </div>
         </article>`,
       )
       .join("");
   }
 
+  function issueGroupsMarkup(issues = visibleIssues()) {
+    if (!issues.length) {
+      return emptyIssuesMarkup();
+    }
+
+    const priority = { critical: 0, warning: 1, formatting: 2 };
+    const groups = new Map();
+    issues.forEach((issue) => {
+      if (!groups.has(issue.groupKey)) {
+        groups.set(issue.groupKey, {
+          key: issue.groupKey,
+          severity: issue.severity,
+          field: issue.field,
+          message: issue.message,
+          detail: issue.detail,
+          issues: [],
+        });
+      }
+      groups.get(issue.groupKey).issues.push(issue);
+    });
+
+    return [...groups.values()]
+      .sort((a, b) => {
+        const severityDifference =
+          priority[a.severity] - priority[b.severity];
+        if (severityDifference) return severityDifference;
+        const countDifference = b.issues.length - a.issues.length;
+        if (countDifference) return countDifference;
+        return a.message.localeCompare(b.message);
+      })
+      .map((group) => {
+        const pairs = proposalPairs(group.issues);
+        const actionable = group.issues.filter(
+          (issue) =>
+            !issue.ignored &&
+            issue.rowIndex != null &&
+            issue.column &&
+            issue.proposed != null,
+        );
+        const firstEditable = group.issues.find(
+          (issue) => issue.rowIndex != null && issue.column,
+        );
+        const groupKey = escapeHtml(group.key);
+        const rows = compactRowRanges(
+          group.issues.map((issue) => issue.excelRow),
+        );
+        const actionLabel = actionable.length
+          ? actionable.every((issue) => issue.safe)
+            ? `Fix all ${actionable.length}`
+            : `Apply ${actionable.length} suggestions`
+          : "";
+
+        return `
+          <details class="issue-group severity-${group.severity} ${
+            state.issueStatus === "ignored" ? "is-ignored" : ""
+          }" open>
+            <summary>
+              ${severityIcon(group.issues[0])}
+              <span class="group-heading">
+                <strong>${escapeHtml(group.message)}</strong>
+                <span>${escapeHtml(group.field)} · ${escapeHtml(rows)}</span>
+              </span>
+              <span class="group-count">${group.issues.length}</span>
+              <span class="group-chevron" aria-hidden="true">⌄</span>
+            </summary>
+            <div class="group-body">
+              <p>${escapeHtml(group.detail)}</p>
+              ${
+                pairs.length
+                  ? `<div class="proposal-summary">
+                      ${pairs
+                        .slice(0, 8)
+                        .map(
+                          (pair) => `<div class="proposal-row">
+                            <span class="value-chip">${escapeHtml(pair.original)}</span>
+                            <span>→</span>
+                            <span class="value-chip">${escapeHtml(pair.proposed)}</span>
+                            <strong>${pair.count}</strong>
+                          </div>`,
+                        )
+                        .join("")}
+                      ${
+                        pairs.length > 8
+                          ? `<span class="more-proposals">+${pairs.length - 8} more value pairs</span>`
+                          : ""
+                      }
+                    </div>`
+                  : ""
+              }
+              <div class="group-actions">
+                ${
+                  actionable.length
+                    ? `<button class="primary-small-button" type="button" data-fix-group="${groupKey}">${actionLabel}</button>`
+                    : ""
+                }
+                ${
+                  canBulkFill(group.issues)
+                    ? `<button class="primary-small-button fill-button" type="button" data-fill-group="${groupKey}">Fill rows…</button>`
+                    : ""
+                }
+                ${
+                  firstEditable
+                    ? `<button class="small-button edit-cell-button" type="button" data-edit-issue="${firstEditable.id}">Edit first row</button>`
+                    : ""
+                }
+                <button class="small-button ${
+                  state.issueStatus === "ignored"
+                    ? "restore-button"
+                    : "ignore-button"
+                }" type="button" ${
+                  state.issueStatus === "ignored"
+                    ? `data-restore-group="${groupKey}">Restore all ${group.issues.length}`
+                    : `data-ignore-group="${groupKey}">Ignore all ${group.issues.length}`
+                }</button>
+              </div>
+            </div>
+          </details>`;
+      })
+      .join("");
+  }
+
+  function issuesMarkup() {
+    return state.issueView === "rows"
+      ? issueRowsMarkup()
+      : issueGroupsMarkup();
+  }
+
+  function issueById(issueId) {
+    return state.issues.find((issue) => issue.id === issueId);
+  }
+
+  function issueGroup(groupKey, includeIgnored = true) {
+    return state.issues.filter(
+      (issue) =>
+        issue.groupKey === groupKey && (includeIgnored || !issue.ignored),
+    );
+  }
+
+  function issueListHeading() {
+    const relevant = visibleIssues();
+    return `${relevant.length} ${
+      relevant.length === 1 ? "issue" : "issues"
+    } · ${problemTypeCount(relevant)} problem ${
+      problemTypeCount(relevant) === 1 ? "type" : "types"
+    }`;
+  }
+
   function issueCellMap() {
     const map = new Map();
     state.issues.forEach((issue) => {
+      if (issue.ignored) return;
       if (issue.rowIndex == null || !issue.column) return;
       const key = `${issue.rowIndex}|${issue.column}`;
       const current = map.get(key);
@@ -1691,10 +1973,143 @@
       </div>`;
   }
 
+  function parseExcelRowExpression(expression) {
+    const text = String(expression || "").trim();
+    if (!text) {
+      return { rowIndices: [], error: "Enter at least one Excel row number." };
+    }
+
+    const parts = text
+      .split(/[,;]+/)
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (!parts.length) {
+      return { rowIndices: [], error: "Enter at least one Excel row number." };
+    }
+
+    const selected = new Set();
+    for (const part of parts) {
+      const match = part.match(/^(\d+)(?:\s*[-–—]\s*(\d+))?$/);
+      if (!match) {
+        return {
+          rowIndices: [],
+          error: `“${part}” is not a row number or range.`,
+        };
+      }
+      const first = Number(match[1]);
+      const second = match[2] ? Number(match[2]) : first;
+      const start = Math.min(first, second);
+      const end = Math.max(first, second);
+      state.excelRows.forEach((excelRow, rowIndex) => {
+        if (excelRow >= start && excelRow <= end) selected.add(rowIndex);
+      });
+    }
+
+    if (!selected.size) {
+      return {
+        rowIndices: [],
+        error: "None of those Excel rows are present in the imported table.",
+      };
+    }
+    return { rowIndices: [...selected].sort((a, b) => a - b), error: "" };
+  }
+
+  function bulkFillStats(expression, column) {
+    const parsed = parseExcelRowExpression(expression);
+    if (parsed.error) {
+      return {
+        rowIndices: [],
+        emptyRowIndices: [],
+        protectedCount: 0,
+        error: parsed.error,
+      };
+    }
+    const emptyRowIndices = parsed.rowIndices.filter(
+      (rowIndex) =>
+        state.rows[rowIndex] && isEmpty(state.rows[rowIndex][column]),
+    );
+    return {
+      rowIndices: parsed.rowIndices,
+      emptyRowIndices,
+      protectedCount: parsed.rowIndices.length - emptyRowIndices.length,
+      error: "",
+    };
+  }
+
+  function bulkFillPreviewCopy(expression, column) {
+    const stats = bulkFillStats(expression, column);
+    if (stats.error) return stats.error;
+    return `${stats.emptyRowIndices.length} empty ${
+      stats.emptyRowIndices.length === 1 ? "cell" : "cells"
+    } will be filled. ${stats.protectedCount} existing ${
+      stats.protectedCount === 1 ? "value is" : "values are"
+    } protected.`;
+  }
+
+  function bulkFillModalMarkup() {
+    if (!state.bulkFill) return "";
+    const { field, column, rowExpression, value, error } = state.bulkFill;
+    return `
+      <div class="modal-backdrop" id="bulk-fill-backdrop">
+        <section class="bulk-fill-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-fill-title">
+          <div class="modal-head">
+            <div>
+              <p class="eyebrow">Careful bulk edit</p>
+              <h3 id="bulk-fill-title">Fill missing ${escapeHtml(field)}</h3>
+            </div>
+            <button class="modal-close" id="bulk-fill-close" type="button" aria-label="Close">×</button>
+          </div>
+          <form id="bulk-fill-form">
+            <label class="modal-field">
+              <span>Value to insert</span>
+              <input id="bulk-fill-value" type="text" value="${escapeHtml(
+                value,
+              )}" autocomplete="off" required />
+            </label>
+            <label class="modal-field">
+              <span>Excel rows</span>
+              <input id="bulk-fill-rows" type="text" value="${escapeHtml(
+                rowExpression,
+              )}" autocomplete="off" required />
+              <small>Examples: 125–138 or 125–138, 142, 148–156</small>
+            </label>
+            <label class="protected-option">
+              <input type="checkbox" checked disabled />
+              <span>Fill empty cells only. Existing values are never overwritten.</span>
+            </label>
+            <div class="bulk-fill-preview ${
+              error ? "has-error" : ""
+            }" id="bulk-fill-preview">${
+              error
+                ? escapeHtml(error)
+                : escapeHtml(bulkFillPreviewCopy(rowExpression, column))
+            }</div>
+            <div class="modal-actions">
+              <button class="secondary-button" id="bulk-fill-cancel" type="button">Cancel</button>
+              <button class="primary-button" type="submit">Apply bulk fill</button>
+            </div>
+          </form>
+        </section>
+      </div>`;
+  }
+
   function renderDiagnosis() {
     const counts = issueCounts();
     const activeIndex = state.exported ? 3 : counts.safe || counts.confirm ? 2 : 3;
     const unresolved = counts.critical + counts.warning;
+    const statusIssues = state.issues.filter((issue) =>
+      state.issueStatus === "ignored" ? issue.ignored : !issue.ignored,
+    );
+    const statusCounts = statusIssues.reduce(
+      (result, issue) => {
+        result[issue.severity] += 1;
+        return result;
+      },
+      { critical: 0, warning: 0, formatting: 0 },
+    );
+    const openProblemTypes = problemTypeCount(
+      state.issues.filter((issue) => !issue.ignored),
+    );
 
     shell(
       `
@@ -1720,7 +2135,7 @@
           <article class="summary-card is-overview">
             <span class="summary-label">Table health</span>
             <span class="summary-value">${unresolved === 0 ? "Ready" : "Needs review"}</span>
-            <span class="summary-detail">${state.rows.length} records · ${state.columns.length} columns · ${state.changes.length} accepted changes</span>
+            <span class="summary-detail">${state.rows.length} records · ${state.columns.length} columns · ${openProblemTypes} problem types · ${state.changes.length} accepted changes</span>
           </article>
           <article class="summary-card is-critical">
             <span class="summary-label">Critical</span>
@@ -1745,23 +2160,38 @@
         </section>
 
         <div class="diagnosis-toolbar">
-          <div class="toolbar-group" aria-label="Issue filters">
-            ${[
-              ["all", `All ${state.issues.length}`],
-              ["critical", `Critical ${counts.critical}`],
-              ["warning", `Review ${counts.warning}`],
-              ["formatting", `Formatting ${counts.formatting}`],
-            ]
-              .map(
-                ([key, label]) =>
-                  `<button class="filter-button ${
-                    state.filter === key ? "is-active" : ""
-                  }" type="button" data-filter="${key}">${label}</button>`,
-              )
-              .join("")}
+          <div class="toolbar-stack">
+            <div class="toolbar-group" aria-label="Issue status">
+              <button class="filter-button ${
+                state.issueStatus === "open" ? "is-active" : ""
+              }" type="button" data-issue-status="open">Open ${counts.total}</button>
+              <button class="filter-button ignored-filter ${
+                state.issueStatus === "ignored" ? "is-active" : ""
+              }" type="button" data-issue-status="ignored">Ignored ${counts.ignored}</button>
+            </div>
+            <div class="toolbar-group" aria-label="Issue severity filters">
+              ${[
+                ["all", `All ${statusIssues.length}`],
+                ["critical", `Critical ${statusCounts.critical}`],
+                ["warning", `Review ${statusCounts.warning}`],
+                ["formatting", `Formatting ${statusCounts.formatting}`],
+              ]
+                .map(
+                  ([key, label]) =>
+                    `<button class="filter-button ${
+                      state.filter === key ? "is-active" : ""
+                    }" type="button" data-filter="${key}">${label}</button>`,
+                )
+                .join("")}
+            </div>
           </div>
           <div class="toolbar-group">
             <button class="ghost-button" id="mapping-button" type="button">← Field mapping</button>
+            ${
+              state.issueStatus === "ignored" && counts.ignored
+                ? `<button class="secondary-button" id="restore-all-ignored" type="button">Restore all ignored</button>`
+                : ""
+            }
             <button class="secondary-button" id="reset-button" type="button" ${
               state.changes.length ? "" : "disabled"
             }>Reset accepted changes</button>
@@ -1774,9 +2204,20 @@
         <div class="diagnosis-layout">
           <section class="issue-panel">
             <div class="panel-head">
-              <div><h3>Check-up notes</h3><p>Issues are tied to the original Excel row numbers.</p></div>
+              <div>
+                <h3>Check-up notes</h3>
+                <p>${issueListHeading()} · Excel row numbers are preserved.</p>
+              </div>
+              <div class="view-switch" aria-label="Issue view">
+                <button class="tab-button ${
+                  state.issueView === "grouped" ? "is-active" : ""
+                }" type="button" data-issue-view="grouped">Grouped</button>
+                <button class="tab-button ${
+                  state.issueView === "rows" ? "is-active" : ""
+                }" type="button" data-issue-view="rows">By row</button>
+              </div>
             </div>
-            <div class="issue-list">${issueRowsMarkup()}</div>
+            <div class="issue-list">${issuesMarkup()}</div>
           </section>
 
           <aside class="preview-panel">
@@ -1809,7 +2250,8 @@
             </div>
           </aside>
         </div>
-        <p class="footer-note">EntoData Doctor v0.2 · no account · no upload · source columns are preserved</p>
+        <p class="footer-note">EntoData Doctor v0.3 · no account · no upload · source columns are preserved</p>
+        ${bulkFillModalMarkup()}
       </main>`,
       activeIndex,
     );
@@ -1821,15 +2263,66 @@
       });
     });
 
+    document.querySelectorAll("[data-issue-status]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.issueStatus = button.dataset.issueStatus;
+        state.filter = "all";
+        renderDiagnosis();
+      });
+    });
+
+    document.querySelectorAll("[data-issue-view]").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.issueView = button.dataset.issueView;
+        renderDiagnosis();
+      });
+    });
+
     document.querySelectorAll("[data-fix-issue]").forEach((button) => {
       button.addEventListener("click", () =>
         applyIssue(button.dataset.fixIssue),
       );
     });
 
+    document.querySelectorAll("[data-fix-group]").forEach((button) => {
+      button.addEventListener("click", () =>
+        applyIssueGroup(button.dataset.fixGroup),
+      );
+    });
+
     document.querySelectorAll("[data-edit-issue]").forEach((button) => {
       button.addEventListener("click", () =>
         focusIssueCell(button.dataset.editIssue),
+      );
+    });
+
+    document.querySelectorAll("[data-ignore-issue]").forEach((button) => {
+      button.addEventListener("click", () =>
+        setIssueIgnored(button.dataset.ignoreIssue, true),
+      );
+    });
+
+    document.querySelectorAll("[data-restore-issue]").forEach((button) => {
+      button.addEventListener("click", () =>
+        setIssueIgnored(button.dataset.restoreIssue, false),
+      );
+    });
+
+    document.querySelectorAll("[data-ignore-group]").forEach((button) => {
+      button.addEventListener("click", () =>
+        setIssueGroupIgnored(button.dataset.ignoreGroup, true),
+      );
+    });
+
+    document.querySelectorAll("[data-restore-group]").forEach((button) => {
+      button.addEventListener("click", () =>
+        setIssueGroupIgnored(button.dataset.restoreGroup, false),
+      );
+    });
+
+    document.querySelectorAll("[data-fill-group]").forEach((button) => {
+      button.addEventListener("click", () =>
+        openBulkFill(button.dataset.fillGroup),
       );
     });
 
@@ -1892,6 +2385,62 @@
       });
     }
 
+    const restoreAllIgnored = document.getElementById("restore-all-ignored");
+    if (restoreAllIgnored) {
+      restoreAllIgnored.addEventListener("click", restoreAllIgnoredIssues);
+    }
+
+    const bulkFillForm = document.getElementById("bulk-fill-form");
+    if (bulkFillForm && state.bulkFill) {
+      const valueInput = document.getElementById("bulk-fill-value");
+      const rowsInput = document.getElementById("bulk-fill-rows");
+      const preview = document.getElementById("bulk-fill-preview");
+      const closeBulkFill = () => {
+        state.bulkFill = null;
+        renderDiagnosis();
+      };
+      const updateBulkPreview = () => {
+        const copy = bulkFillPreviewCopy(
+          rowsInput.value,
+          state.bulkFill.column,
+        );
+        const hasError = Boolean(
+          bulkFillStats(rowsInput.value, state.bulkFill.column).error,
+        );
+        preview.textContent = copy;
+        preview.classList.toggle("has-error", hasError);
+      };
+
+      rowsInput.addEventListener("input", updateBulkPreview);
+      document
+        .getElementById("bulk-fill-close")
+        .addEventListener("click", closeBulkFill);
+      document
+        .getElementById("bulk-fill-cancel")
+        .addEventListener("click", closeBulkFill);
+      document
+        .getElementById("bulk-fill-backdrop")
+        .addEventListener("click", (event) => {
+          if (event.target.id === "bulk-fill-backdrop") closeBulkFill();
+        });
+      bulkFillForm.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeBulkFill();
+        }
+      });
+      bulkFillForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        state.bulkFill.value = valueInput.value;
+        state.bulkFill.rowExpression = rowsInput.value;
+        applyBulkFill();
+      });
+      window.requestAnimationFrame(() => {
+        valueInput.focus();
+        valueInput.select();
+      });
+    }
+
     document.getElementById("apply-safe-button").addEventListener("click", applySafeFixes);
     document.getElementById("reset-button").addEventListener("click", resetChanges);
     document.getElementById("mapping-button").addEventListener("click", () => {
@@ -1912,6 +2461,132 @@
       Reason: issue.message,
       "Change type": issue.safe ? "Safe automatic fix" : "User-confirmed suggestion",
     });
+  }
+
+  function setIssueIgnored(issueId, ignored) {
+    const issue = issueById(issueId);
+    if (!issue) return;
+    if (ignored) state.ignoredIssueKeys.add(issue.key);
+    else state.ignoredIssueKeys.delete(issue.key);
+    state.exported = false;
+    runDiagnosis();
+    renderDiagnosis();
+  }
+
+  function setIssueGroupIgnored(groupKey, ignored) {
+    const issues = issueGroup(groupKey);
+    issues.forEach((issue) => {
+      if (ignored) state.ignoredIssueKeys.add(issue.key);
+      else state.ignoredIssueKeys.delete(issue.key);
+    });
+    state.exported = false;
+    runDiagnosis();
+    renderDiagnosis();
+  }
+
+  function restoreAllIgnoredIssues() {
+    state.ignoredIssueKeys.clear();
+    state.issueStatus = "open";
+    state.filter = "all";
+    state.exported = false;
+    runDiagnosis();
+    renderDiagnosis();
+  }
+
+  function applyIssueGroup(groupKey) {
+    const issues = issueGroup(groupKey, false).filter(
+      (issue) =>
+        issue.rowIndex != null &&
+        issue.column &&
+        issue.proposed != null,
+    );
+    issues.forEach((issue) => {
+      const oldValue = state.rows[issue.rowIndex][issue.column];
+      if (String(oldValue) === String(issue.proposed)) return;
+      state.rows[issue.rowIndex][issue.column] = issue.proposed;
+      recordChange(issue, oldValue, issue.proposed);
+    });
+    state.exported = false;
+    runDiagnosis();
+    renderDiagnosis();
+  }
+
+  function openBulkFill(groupKey) {
+    const issues = issueGroup(groupKey, false);
+    const columns = new Set(
+      issues
+        .filter((issue) => issue.rowIndex != null && issue.column)
+        .map((issue) => issue.column),
+    );
+    if (columns.size !== 1) return;
+    const column = [...columns][0];
+    const emptyIssues = issues.filter(
+      (issue) =>
+        issue.rowIndex != null &&
+        state.rows[issue.rowIndex] &&
+        isEmpty(state.rows[issue.rowIndex][column]),
+    );
+    if (!emptyIssues.length) return;
+
+    state.bulkFill = {
+      groupKey,
+      field: emptyIssues[0].field,
+      column,
+      rowExpression: compactNumberRanges(
+        emptyIssues.map((issue) => issue.excelRow),
+      ),
+      value: "",
+      error: "",
+    };
+    renderDiagnosis();
+  }
+
+  function applyBulkFill() {
+    if (!state.bulkFill) return;
+    const value = cleanWhitespace(String(state.bulkFill.value || ""));
+    if (!value) {
+      state.bulkFill.error = "Enter the value that should fill the empty cells.";
+      renderDiagnosis();
+      return;
+    }
+
+    const stats = bulkFillStats(
+      state.bulkFill.rowExpression,
+      state.bulkFill.column,
+    );
+    if (stats.error) {
+      state.bulkFill.error = stats.error;
+      renderDiagnosis();
+      return;
+    }
+    if (!stats.emptyRowIndices.length) {
+      state.bulkFill.error =
+        "Those rows contain no empty cells in this column.";
+      renderDiagnosis();
+      return;
+    }
+
+    const { field, column } = state.bulkFill;
+    stats.emptyRowIndices.forEach((rowIndex) => {
+      const oldValue = state.rows[rowIndex][column];
+      state.rows[rowIndex][column] = value;
+      state.changes.push({
+        "Excel row": state.excelRows[rowIndex] || "",
+        Field: field,
+        Column: column,
+        Original: oldValue,
+        Cleaned: value,
+        Reason: `Bulk fill missing ${field}`,
+        "Change type": "Bulk fill in EntoData Doctor",
+      });
+    });
+
+    state.bulkFill = null;
+    state.issueStatus = "open";
+    state.filter = "all";
+    state.exported = false;
+    runDiagnosis();
+    renderDiagnosis();
   }
 
   function saveManualEdit(rowIndex, columnIndex, oldValue, newValue) {
@@ -1967,7 +2642,13 @@
 
   function applyIssue(issueId) {
     const issue = state.issues.find((item) => item.id === issueId);
-    if (!issue || issue.rowIndex == null || !issue.column || issue.proposed == null)
+    if (
+      !issue ||
+      issue.ignored ||
+      issue.rowIndex == null ||
+      !issue.column ||
+      issue.proposed == null
+    )
       return;
     const oldValue = state.rows[issue.rowIndex][issue.column];
     state.rows[issue.rowIndex][issue.column] = issue.proposed;
@@ -1980,6 +2661,7 @@
   function applySafeFixes() {
     const fixes = state.issues.filter(
       (issue) =>
+        !issue.ignored &&
         issue.safe &&
         issue.rowIndex != null &&
         issue.column &&
@@ -2027,6 +2709,7 @@
     });
     const issueRows = state.issues.map((issue) => ({
       "Excel row": issue.excelRow || "",
+      Status: issue.ignored ? "Ignored by user" : "Open",
       Severity: issue.severity,
       Field: issue.field,
       Column: issue.column,
@@ -2103,6 +2786,10 @@
       issues: [],
       changes: [],
       filter: "all",
+      issueView: "grouped",
+      issueStatus: "open",
+      ignoredIssueKeys: new Set(),
+      bulkFill: null,
       previewMode: "current",
       previewPage: 0,
       previewRowsPerPage: 20,
